@@ -1,165 +1,171 @@
-from flask import Flask, jsonify, request
-from typing import List, Dict, Any, Optional
+from flask import Flask, request, jsonify
+import requests
 
-MOCK_INVENTORY: List[Dict[str, Any]] = [
+app = Flask(__name__)
+
+inventory = [
     {
         "id": 1,
-        "sku": "ALM-ORG-32OZ",
         "name": "Organic Almond Milk",
         "brand": "Silk",
         "price": 4.99,
         "stock": 24,
+        "sku": "ALM-ORG-32OZ",
         "barcode": "1234567890123",
         "ingredients_text": "Filtered water, almonds, cane sugar",
     },
     {
         "id": 2,
-        "sku": "OAT-PLN-32OZ",
         "name": "Plain Oat Milk",
         "brand": "Oatly",
         "price": 5.49,
         "stock": 12,
+        "sku": "OAT-PLN-32OZ",
         "barcode": "2345678901234",
         "ingredients_text": "Water, oats, rapeseed oil",
     },
     {
         "id": 3,
-        "sku": "PB-CRNCH-16OZ",
         "name": "Crunchy Peanut Butter",
         "brand": "Justin's",
         "price": 6.99,
         "stock": 8,
+        "sku": "PB-CRNCH-16OZ",
         "barcode": "3456789012345",
         "ingredients_text": "Dry roasted peanuts, palm oil",
     },
 ]
 
-def _next_id(items: List[Dict[str, Any]]) -> int:
-    return (max((i["id"] for i in items), default=0) + 1) if items else 1
+def validate_item(data):
+    errors = []
+    if not data.get("name") or not isinstance(data.get("name"), str):
+        errors.append("name (string) is required")
+    if not data.get("brand") or not isinstance(data.get("brand"), str):
+        errors.append("brand (string) is required")
+    if not isinstance(data.get("price"), (int, float)):
+        errors.append("price (number) is required")
+    if not isinstance(data.get("stock"), int):
+        errors.append("stock (integer) is required")
+    return errors
 
-def _find_item(items: List[Dict[str, Any]], item_id: int) -> Optional[Dict[str, Any]]:
-    for it in items:
-        if it["id"] == item_id:
-            return it
-    return None
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
 
-def create_app():
-    app = Flask(__name__)
+@app.route("/inventory", methods=["GET"])
+def list_inventory():
+    return jsonify(inventory)
 
-    @app.get("/health")
-    def health():
-        return jsonify({"status": "ok"}), 200
+@app.route("/inventory/<int:item_id>", methods=["GET"])
+def get_item(item_id):
+    for item in inventory:
+        if item["id"] == item_id:
+            return jsonify(item)
+    return jsonify({"error": f"item {item_id} not found"}), 404
 
-    @app.get("/inventory")
-    def list_inventory():
-        return jsonify(MOCK_INVENTORY), 200
+@app.route("/inventory", methods=["POST"])
+def add_item():
+    data = request.get_json()
+    errors = validate_item(data)
+    if errors:
+        return jsonify({"errors": errors}), 400
+    new_id = max([i["id"] for i in inventory], default=0) + 1
+    item = {
+        "id": new_id,
+        "name": data["name"],
+        "brand": data["brand"],
+        "price": float(data["price"]),
+        "stock": int(data["stock"]),
+        "sku": data.get("sku", ""),
+        "barcode": data.get("barcode", ""),
+        "ingredients_text": data.get("ingredients_text", ""),
+    }
+    inventory.append(item)
+    return jsonify(item), 201
 
-    @app.get("/inventory/<int:item_id>")
-    def get_inventory_item(item_id: int):
-        item = _find_item(MOCK_INVENTORY, item_id)
-        if not item:
-            return jsonify({"error": f"item {item_id} not found"}), 404
-        return jsonify(item), 200
+@app.route("/inventory/<int:item_id>", methods=["PATCH"])
+def update_item(item_id):
+    data = request.get_json()
+    for item in inventory:
+        if item["id"] == item_id:
+            item.update({k: v for k, v in data.items() if k in item})
+            return jsonify(item)
+    return jsonify({"error": f"item {item_id} not found"}), 404
 
-    @app.post("/inventory")
-    def create_inventory_item():
-        if not request.is_json:
-            return jsonify({"error": "Content-Type must be application/json"}), 415
-        data = request.get_json(silent=True) or {}
+@app.route("/inventory/<int:item_id>", methods=["DELETE"])
+def delete_item(item_id):
+    global inventory
+    for item in inventory:
+        if item["id"] == item_id:
+            inventory = [i for i in inventory if i["id"] != item_id]
+            return "", 204
+    return jsonify({"error": f"item {item_id} not found"}), 404
 
-        errors = []
-        if not isinstance(data.get("name"), str) or not data.get("name"):
-            errors.append("name (string) is required")
-        if not isinstance(data.get("brand"), str) or not data.get("brand"):
-            errors.append("brand (string) is required")
+@app.route("/external/barcode/<barcode>", methods=["GET"])
+def external_barcode(barcode):
+    url = f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "inventory-app/1.0"}, timeout=5)
+        data = resp.json()
+    except Exception:
+        return jsonify({"error": "failed to fetch product"}), 502
+    if data.get("status") != 1:
+        return jsonify({"error": f"barcode {barcode} not found"}), 404
+    product = data.get("product", {})
+    return jsonify({
+        "barcode": barcode,
+        "name": product.get("product_name", ""),
+        "brand": product.get("brands", ""),
+        "ingredients_text": product.get("ingredients_text", ""),
+    })
 
-        price = data.get("price")
-        try:
-            price = float(price)
-        except (TypeError, ValueError):
-            errors.append("price (number) is required")
-
-        stock = data.get("stock")
-        try:
-            stock = int(stock)
-            if stock < 0:
-                errors.append("stock must be >= 0")
-        except (TypeError, ValueError):
-            errors.append("stock (integer) is required")
-
-        if errors:
-            return jsonify({"errors": errors}), 400
-
-        new_item = {
-            "id": _next_id(MOCK_INVENTORY),
-            "sku": data.get("sku") or "",
-            "name": data["name"],
-            "brand": data["brand"],
-            "price": price,
-            "stock": stock,
-            "barcode": data.get("barcode") or "",
-            "ingredients_text": data.get("ingredients_text") or "",
+@app.route("/external/search", methods=["GET"])
+def external_search():
+    query = request.args.get("q")
+    if not query:
+        return jsonify({"error": "q param is required"}), 400
+    url = "https://world.openfoodfacts.org/cgi/search.pl"
+    params = {"search_terms": query, "search_simple": 1, "action": "process", "json": 1, "page_size": 5}
+    try:
+        resp = requests.get(url, headers={"User-Agent": "inventory-app/1.0"}, params=params, timeout=5)
+        data = resp.json()
+    except Exception:
+        return jsonify({"error": "failed to search products"}), 502
+    products = data.get("products", [])
+    return jsonify([
+        {
+            "barcode": p.get("id", ""),
+            "name": p.get("product_name", ""),
+            "brand": p.get("brands", ""),
+            "ingredients_text": p.get("ingredients_text", ""),
         }
-        MOCK_INVENTORY.append(new_item)
-        return jsonify(new_item), 201
+        for p in products
+    ])
 
-    @app.patch("/inventory/<int:item_id>")
-    def update_inventory_item(item_id: int):
-        if not request.is_json:
-            return jsonify({"error": "Content-Type must be application/json"}), 415
-
-        item = _find_item(MOCK_INVENTORY, item_id)
-        if not item:
-            return jsonify({"error": f"item {item_id} not found"}), 404
-
-        data = request.get_json(silent=True) or {}
-        allowed = {"name", "brand", "price", "stock", "sku", "barcode", "ingredients_text"}
-        unknown = [k for k in data.keys() if k not in allowed]
-        if unknown:
-            return jsonify({"errors": [f"unknown field: {k}" for k in unknown]}), 400
-
-        errors = []
-
-        if "name" in data:
-            if not isinstance(data["name"], str) or not data["name"]:
-                errors.append("name must be a non-empty string")
-        if "brand" in data:
-            if not isinstance(data["brand"], str) or not data["brand"]:
-                errors.append("brand must be a non-empty string")
-        if "price" in data:
-            try:
-                data["price"] = float(data["price"])
-            except (TypeError, ValueError):
-                errors.append("price must be a number")
-        if "stock" in data:
-            try:
-                data["stock"] = int(data["stock"])
-                if data["stock"] < 0:
-                    errors.append("stock must be >= 0")
-            except (TypeError, ValueError):
-                errors.append("stock must be an integer")
-        for key in ("sku", "barcode", "ingredients_text"):
-            if key in data and data[key] is not None and not isinstance(data[key], str):
-                errors.append(f"{key} must be a string")
-
-        if errors:
-            return jsonify({"errors": errors}), 400
-
-        for k, v in data.items():
-            item[k] = v
-
-        return jsonify(item), 200
-
-    @app.delete("/inventory/<int:item_id>")
-    def delete_inventory_item(item_id: int):
-        item = _find_item(MOCK_INVENTORY, item_id)
-        if not item:
-            return jsonify({"error": f"item {item_id} not found"}), 404
-        MOCK_INVENTORY.remove(item)
-        return ("", 204)
-
-    return app
+@app.route("/inventory/enrich/<barcode>", methods=["POST"])
+def enrich_item(barcode):
+    url = f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "inventory-app/1.0"}, timeout=5)
+        data = resp.json()
+    except Exception:
+        return jsonify({"error": "failed to fetch product"}), 502
+    if data.get("status") != 1:
+        return jsonify({"error": f"barcode {barcode} not found"}), 404
+    product = data.get("product", {})
+    new_id = max([i["id"] for i in inventory], default=0) + 1
+    item = {
+        "id": new_id,
+        "name": product.get("product_name", ""),
+        "brand": product.get("brands", ""),
+        "price": 0.0,
+        "stock": 0,
+        "sku": "",
+        "barcode": barcode,
+        "ingredients_text": product.get("ingredients_text", ""),
+    }
+    inventory.append(item)
+    return jsonify(item), 201
 
 if __name__ == "__main__":
-    app = create_app()
-    app.run(port=5555, debug=True)
+    app.run(host="0.0.0.0", port=5555)
